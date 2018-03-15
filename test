@@ -1,0 +1,252 @@
+<?php
+
+/**
+ * Корзина
+ */
+class StepCart extends StepAbstract {
+
+    protected $isEmpty = false,
+            $isLogged = false;
+
+    /**
+     * Инициализация
+     */
+    public function Init() {
+        $randompassword = Tools::passwdGen(8);
+        $this->context->smarty->assign('randompassword', $randompassword);
+        $this->isEmpty = (int) $this->context->cart->nbProducts() == 0;
+        $this->isLogged = $this->context->customer->isLogged(true);
+    }
+
+    /**
+     * Обработка
+     */
+    public function Process() {
+        if (Tools::isSubmit('ajax') && Tools::isSubmit('submitPhoneDialog')) {
+            $phone = (string) Tools::getValue('phone', '');
+            if (empty($phone) || !Validate::isPhone1Number($phone)) {
+                echo Ajax::JsonError($this->controller->module->l('Invalid phone number', 'StepCart'));
+                exit;
+            }
+
+            $to = (string) Configuration::get(TimeCostDelivery::PHONE_DIALOG_EMAIL_ID);
+            if (!empty($to) && Validate::isEmail($to)) {
+                $tmp = array();
+
+                if (Tools::isSubmit('id_product') && Tools::getValue('id_product')) {
+                    $product = new Product((int) Tools::getValue('id_product'));
+                    $tmp[] = '<p><a href="' . $this->context->link->getProductLink($product) . '">' . $product->name[$this->context->language->id] . '</a></p>';
+                } else {
+                    $url = $this->context->link->getPageLink('order');
+                    $url = parse_url($url);
+                    $url = $url['scheme'] . '://' . $url['host'] . '/' .
+                            ( (string) Configuration::get(TimeCostDelivery::ADMIN_PATH) ) . '/' .
+                            $this->context->link->getAdminLink('AdminCarts', false) . '&id_cart=' . $this->context->cart->id . '&viewcart&token=';
+
+                    $employeeIds = (string) Configuration::get(TimeCostDelivery::EMPLOYEE_ID);
+                    $employeeIds = preg_split('/,/', $employeeIds);
+                    $employeeIds = array_map('trim', $employeeIds);
+
+                    foreach ($employeeIds as $employeeId) {
+                        $employee = new Employee($employeeId);
+                        if (Validate::isLoadedObject($employee)) {
+                            $tmp[] = '<p><a href="' . $url . Tools::getAdminToken('AdminCarts' . Tab::getIdFromClassName('AdminCarts') . $employeeId) . '">' . $employee->lastname . ' ' . $employee->firstname . '</a></p>';
+                        }
+                    }
+                }
+
+                $links = join("\r\n", $tmp);
+
+                $timezoneOffset = -round((float) Tools::getValue('timezone_offset') / 60);
+                $serverOffset = round((float) date('Z') / ( 60 * 60 ));
+                $timezone = $serverOffset - $timezoneOffset;
+
+                $from = (string) Configuration::get('PS_SHOP_EMAIL');
+                $subject = $this->controller->module->l('Order in 1 click', 'StepCart');
+
+                $templateVars = array(
+                    '{subject}' => $subject,
+                    '{phone}' => $phone,
+                    '{timezone}' => $timezone,
+                    '{links}' => $links
+                );
+
+                $id_lang = LanguageCore::getIdByIso('ru');
+                if ($id_lang === false) {
+                    $id_lang = $this->context->language->id;
+                }
+
+                Mail::Send(
+                        $id_lang, 'oneclick', $subject, $templateVars, $to, NULL, $from, NULL, NULL, NULL, _PS_MODULE_DIR_ . 'timecostdelivery/mails/'
+                );
+
+                // присвоение фиктивного клиента
+                $this->context->cart->id_customer = (int) Configuration::get(TimeCostDelivery::ONECLICK_CUSTOMER_ID);
+                $this->context->cart->update();
+            }
+
+            echo Ajax::JsonSuccess($this->controller->module->l('Your request has been accepted. Wait for a call please.', 'StepCart'), '');
+            exit;
+        }
+        if ($this->context->customer->isLogged(true)) {
+            $this->controller->SetRedirect($this->context->link->getPageLink('order', NULL, NULL, array('pick_sender' => 1)));
+            return;
+        }
+
+        if (Tools::isSubmit('submitGuestAccount')) {
+            $customer = new Customer( );
+
+            $customer->lastname = trim((string) Tools::getValue('lastname', ''));
+            $customer->firstname = trim((string) Tools::getValue('name', ''));
+            $customer->passwd = trim((string) Tools::getValue('passwd', ''));
+            $customer->email = trim((string) Tools::getValue('email', ''));
+
+            $names = array('lastname', 'firstname', 'passwd', 'email');
+
+            foreach ($names as $name) {
+                $valid = $customer->validateField($name, $customer->$name, NULL, array(), true);
+                if ($valid !== true) {
+                    $this->controller->errors[] = $valid;
+                }
+            }
+
+            if (Customer::customerExists($customer->email)) {
+                $this->controller->errors[] = Tools::displayError($this->controller->module->l('Данный Email адрес зарегистрирован.Авторизируйтесь! ', 'StepCart'), false);
+                
+            }
+            
+            if (!Configuration::get('PS_CUSTOMER_CREATION_EMAIL')) {
+                return true;
+            }
+
+            return Mail::Send(
+                         $this->context->language->id, 'account', Mail::l('Welcome!'), array(
+                        '{firstname}' => $customer->firstname,
+                        '{lastname}' => $customer->lastname,
+                        '{email}' => $customer->email,
+                        '{passwd}' => Tools::getValue('passwd')), $customer->email, $customer->firstname . ' ' . $customer->lastname
+            );
+
+            if (empty($this->controller->errors)) { // без ошибок, создание учетки, залогинивание пользователя
+                $customer->passwd = Tools::encrypt($customer->passwd);
+                $customer->is_guest = 0;
+                $customer->active = 1;
+
+                if ($customer->add()) {
+                    $customer->logged = 1;
+
+                    $customer->addGroups(array((int) Configuration::get('PS_CUSTOMER_GROUP')));
+
+                    $address = new Address( );
+                    $address->id_customer = $customer->id;
+                    $address->id_country = $this->context->country->id;
+                    $address->alias = 'addressPersonal';
+                    $address->lastname = $customer->lastname;
+                    $address->firstname = $customer->firstname;
+                    $address->id_customer = $customer->id;
+                    $address->deleted = false;
+                    $address->phone = '123456';
+                    $address->address1 = 'empty';
+                    $address->city = 'empty';
+
+                    $address->add();
+
+                    $this->context->customer = $customer;
+                    $this->context->cookie->id_customer = (int) $customer->id;
+                    $this->context->cookie->customer_lastname = $customer->lastname;
+                    $this->context->cookie->customer_firstname = $customer->firstname;
+                    $this->context->cookie->passwd = $customer->passwd;
+                    $this->context->cookie->logged = 1;
+                    $this->context->cookie->email = $customer->email;
+                    $this->context->cookie->is_guest = $customer->is_guest;
+                    $this->context->cookie->id_cart = (int) $this->context->cart->id;
+
+                    $this->context->cart->id_customer = $customer->id;
+                    $this->context->cart->secure_key = $customer->secure_key;
+                    $this->context->cart->update();
+
+
+                    $this->controller->SetRedirect($this->context->link->getPageLink('order', NULL, NULL, array('pick_sender' => 1)));
+                } else {
+                    $this->controller->errors[] = Tools::displayError($this->controller->module->l('An error occurred while creating your account', 'StepCart'), false);
+                }
+            }
+
+            
+        }
+    }
+
+    /**
+     * Подготовка к отрисовке
+     */
+    public function PrepareRender() {
+        $this->AssignCartInformation();
+        $this->context->smarty->assign(array(
+            'genders' => Gender::getGenders(),
+            'clarifyLink' => $this->context->link->getPageLink('order', NULL, $this->context->language->id),
+            'shippingAmount' => 0,
+            'shippingNotPicked' => true,
+            'totalAmount' => $this->context->cart->getOrderTotal(true, Cart::ONLY_PRODUCTS_WITHOUT_SHIPPING)
+        ));
+        if ($this->isLogged) {
+            $this->context->smarty->assign('hide_continue_pick', true);
+        }
+
+        if ($this->isEmpty) {
+            $this->context->smarty->assign('empty', 1);
+        } else {
+            $this->AssignCartInformation();
+
+            $this->context->smarty->assign(array(
+                'phoneDialogMessage' => (string) Configuration::get(TimeCostDelivery::PHONE_DIALOG_MESSAGE_ID),
+                'blockOneClickText' => (string) Configuration::get(TimeCostDelivery::CART_BLOCK_ONE_CLICK),
+                'blockNewAccountText' => (string) Configuration::get(TimeCostDelivery::CART_BLOCK_NEW_ACCOUNT)
+            ));
+
+            if ($this->isLogged) {
+                $proceedParams = array('pick_sender' => 1);
+
+                if (Tools::isSubmit('back')) {
+                    $back = (string) Tools::getValue('back');
+                    $links = array(
+                        'pick_carrier' => array('pick_carrier' => 1),
+                        'pick_sender' => array('pick_sender' => 1)
+                    );
+
+                    if (isset($links[$back])) {
+                        $proceedParams = $links[$back];
+                    }
+                }
+
+                $this->context->smarty->assign(array(
+                    'show_proceed' => true,
+                    'proceedLink' => $this->context->link->getPageLink('order', NULL, $this->context->language->id, $proceedParams)
+                ));
+            }
+        }
+    }
+
+    /**
+     * Получение имени шаблона
+     */
+    public function GetTemplate() {
+        return 'shopping-cart.tpl';
+    }
+
+    /**
+     * Подключение необходимых файлов js или css
+     */
+    public function SetMedia() {
+        $this->controller->addJqueryUi(array('ui.dialog'));
+        $this->controller->addJS(array(
+            _MODULE_DIR_ . '/timecostdelivery/js/tcd_cart.js'
+        ));
+        $this->controller->addJqueryPlugin('typewatch');
+        $this->controller->addJS(array(
+            _THEME_JS_DIR_ . 'tools/vatManagement.js',
+            _THEME_JS_DIR_ . 'tools/statesManagement.js',
+            _THEME_JS_DIR_ . 'authentication.js'
+        ));
+    }
+
+}
